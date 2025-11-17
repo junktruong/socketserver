@@ -15,7 +15,11 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "test": "node index.js"
+    "start": "node index.js"
   },
-  "devDependencies": {}
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "http": "^0.0.1-security",
+    "socket.io": "^4.8.1"
+  }
 }
