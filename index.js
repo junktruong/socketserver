@@ -7,7 +7,7 @@ const PORT = process.env.WS_PORT || 3002;
 const MIN_PLAYERS = 2;
 
 const server = http.createServer((req, res) => {
-    // API /notify – giữ nguyên cho hệ thống notify bạn đã làm
+    // API /notify (giữ như bạn đang dùng)
     if (req.method === "POST" && req.url === "/notify") {
         let body = "";
         req.on("data", (c) => (body += c));
@@ -25,18 +25,24 @@ const server = http.createServer((req, res) => {
 });
 
 const io = new Server(server, {
-    cors: { origin: "*" },
+    cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 // ====== GAME STATE ======
-let players = new Set();        // danh sách userId đang join game
-let bets = {};                  // { userId: { bet: 'tai' | 'xiu', amount: number } }
+let players = new Set();        // danh sách userId
+let bets = {};                  // { userId: { bet, amount } }
 let phase = "waiting_players";  // waiting_players | betting | locked | reveal | payout
 let countdown = 0;
 
 let resultDice = [];
 let resultTotal = 0;
 let resultType = "";            // 'tai' | 'xiu'
+
+// lịch sử ván (giữ ~20 ván)
+let history = []; // [{ dice, total, type, at }]
+
+// streak thắng liên tiếp
+let streaks = {}; // { userId: number }
 
 // ====== HELPER ======
 function broadcast(event, data) {
@@ -46,8 +52,25 @@ function broadcast(event, data) {
 function setPhase(newPhase, time = 0) {
     phase = newPhase;
     countdown = time;
-
     broadcast("phase_change", { phase, countdown });
+}
+
+function broadcastPlayerCount() {
+    broadcast("player_count", { count: players.size });
+}
+
+function broadcastHistory() {
+    broadcast("history", history.slice(-5));
+}
+
+function broadcastLeaderboard() {
+    const entries = Object.entries(streaks)
+        .map(([userId, streak]) => ({ userId, streak }))
+        .filter((x) => x.streak > 0)
+        .sort((a, b) => b.streak - a.streak)
+        .slice(0, 10);
+
+    broadcast("leaderboard", { entries });
 }
 
 // ====== MAIN GAME FLOW ======
@@ -55,7 +78,6 @@ function startGame() {
     console.log("🎮 BẮT ĐẦU VÁN GAME MỚI");
     bets = {};
 
-    // Bắt đầu giai đoạn đặt cược
     setPhase("betting", 40);
 
     const bettingInterval = setInterval(() => {
@@ -76,17 +98,25 @@ function startReveal() {
     setTimeout(() => {
         setPhase("reveal", 5);
 
-        // random 3 viên xúc xắc
         resultDice = [
             Math.floor(Math.random() * 6) + 1,
             Math.floor(Math.random() * 6) + 1,
             Math.floor(Math.random() * 6) + 1,
         ];
-
         resultTotal = resultDice.reduce((a, b) => a + b, 0);
         resultType = resultTotal > 10 ? "tai" : "xiu";
 
         console.log("🎲 KẾT QUẢ:", resultDice, "→", resultTotal, resultType);
+
+        // lưu history
+        history.push({
+            dice: resultDice,
+            total: resultTotal,
+            type: resultType,
+            at: Date.now(),
+        });
+        if (history.length > 20) history.shift();
+        broadcastHistory();
 
         broadcast("reveal", {
             dice: resultDice,
@@ -111,27 +141,30 @@ function startPayout() {
 
     let winners = [];
 
+    // cập nhật streak
     Object.keys(bets).forEach((uid) => {
-        const userBet = bets[uid];
-        if (userBet && userBet.bet === resultType) {
-            const winAmount = userBet.amount * 2;
-            winners.push({ userId: uid, winAmount });
+        const bet = bets[uid];
+        if (!streaks[uid]) streaks[uid] = 0;
 
-            // Gọi API Next.js cộng điểm
+        if (bet.bet === resultType) {
+            const winAmount = bet.amount * 2;
+            winners.push({ userId: uid, winAmount });
+            streaks[uid] += 1;
+
+            // Gọi API cộng điểm
             fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/game/reward`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    userId: uid,
-                    amount: winAmount,
-                }),
+                body: JSON.stringify({ userId: uid, amount: winAmount }),
             }).catch((e) => console.error("Reward API error:", e));
+        } else {
+            streaks[uid] = 0;
         }
     });
 
     console.log("🏆 WINNERS:", winners);
-
     broadcast("payout", { winners });
+    broadcastLeaderboard();
 
     const payoutInterval = setInterval(() => {
         countdown--;
@@ -146,7 +179,7 @@ function startPayout() {
 
 function restartGame() {
     setPhase("waiting_players");
-    console.log("⏸ ĐỢI NGƯỜI CHƠI... (hiện có:", players.size, ")");
+    console.log("⏸ ĐỢI NGƯỜI CHƠI...", players.size);
 
     if (players.size >= MIN_PLAYERS) {
         setTimeout(() => {
@@ -167,9 +200,11 @@ io.on("connection", (socket) => {
         players.add(id);
         socket.join(id);
 
-        console.log("🔗 Player join game:", id, "→ current:", players.size);
+        broadcastPlayerCount();
 
-        // Gửi trạng thái hiện tại
+        console.log("🔗 Player join:", id, "→", players.size);
+
+        // trả trạng thái hiện tại cho client mới
         socket.emit("game_state", {
             phase,
             countdown,
@@ -178,20 +213,27 @@ io.on("connection", (socket) => {
             type: resultType,
         });
 
-        // Nếu đang chờ người chơi & đủ người → start game
+        socket.emit("history", history.slice(-5));
+        socket.emit("leaderboard", {
+            entries: Object.entries(streaks)
+                .map(([uid, streak]) => ({ userId: uid, streak }))
+                .filter((x) => x.streak > 0)
+                .sort((a, b) => b.streak - a.streak)
+                .slice(0, 10),
+        });
+
         if (phase === "waiting_players" && players.size >= MIN_PLAYERS) {
             startGame();
         }
     });
 
-    // Client gửi đặt cược sau khi đã bị trừ điểm ở Next
     socket.on("bet", ({ bet, amount }) => {
         if (!userId) return;
         if (phase !== "betting") return;
         if (!["tai", "xiu"].includes(bet)) return;
 
         bets[userId] = { bet, amount };
-        console.log(`📝 ${userId} cược ${bet} ${amount} điểm`);
+        console.log(`📝 ${userId} bet ${bet} ${amount}`);
         socket.emit("bet_ok", { bet, amount });
     });
 
@@ -199,6 +241,7 @@ io.on("connection", (socket) => {
         console.log("❌ Client disconnected:", socket.id);
         if (userId) {
             players.delete(userId);
+            broadcastPlayerCount();
             console.log("👤 Player out:", userId, "→", players.size);
         }
     });
